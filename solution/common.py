@@ -28,7 +28,7 @@ EPOCHS = 12  # the training loop is additionally capped by TRAIN_BUDGET_SECONDS
 LR = 2e-3
 DEVICE = "cpu"
 TARGET_FPR = 0.20      # hard constraint verified on data/validation
-CAL_TARGET_FPR = 0.15  # calibration quantile: finite-sample margin under 20%
+CAL_TARGET_FPR = 0.16  # calibration quantile: finite-sample margin under 20%
 # Assignment limit: training must stay within 5x the Appendix C reference
 # runtime (measured 179.7s in the grading-like container -> 5x ~ 898s).
 TRAIN_BUDGET_SECONDS = 900
@@ -91,6 +91,8 @@ def load_split(name):
         labels = (df["source class"].to_numpy() != 0).astype(np.int64)
     elif "row_id" in df.columns:
         labels = df["row_id"].to_numpy(dtype=np.int64)
+    elif "row id" in df.columns:
+        labels = df["row id"].to_numpy(dtype=np.int64)
     else:
         raise ValueError(f"No label or row_id column in split '{name}'")
 

@@ -25,9 +25,9 @@ from common import (
     set_seed,
 )
 
-# Time reserved after training for calibration, validation and saving,
-# so a timeout kill never leaves the pipeline without threshold/metrics.
-MARGIN_SECONDS = 180
+# Time reserved after training for calibration, the two validation passes and
+# saving, so a timeout kill never leaves the pipeline without threshold/metrics.
+MARGIN_SECONDS = 240
 
 
 def save_checkpoint(model, path):
@@ -114,16 +114,25 @@ def main():
     with open(models_dir / "threshold.json", "w") as f:
         json.dump({"threshold": threshold}, f, indent=2)
 
-    # Independent verification on data/validation (never used for training).
-    val_X, val_y = load_split("validation")
-    metrics = evaluate(val_y, score_images(model, val_X), threshold)
+    # Independent verification on data/validation (never used for training);
+    # performance on data/validation_augmented is also reported as required.
+    results = {"threshold": threshold}
+    for split in ("validation", "validation_augmented"):
+        sx, sy = load_split(split)
+        results[split] = evaluate(sy, score_images(model, sx), threshold)
     with open(metrics_dir / "task02.json", "w") as f:
-        json.dump({"threshold": threshold, **metrics}, f, indent=2)
+        json.dump(results, f, indent=2)
 
-    status = "OK" if metrics["fpr"] <= 0.20 else "VIOLATED"
     print(f"threshold={threshold:.6f}")
-    print(f"validation recall_ai={metrics['recall']:.4f} fpr={metrics['fpr']:.4f} "
-          f"({status}, constraint <= 0.20) roc_auc={metrics['roc_auc']:.4f}")
+    m = results["validation"]
+    status = "OK" if m["fpr"] <= 0.20 else "VIOLATED"
+    print(f"validation: recall_ai={m['recall']:.4f} fpr={m['fpr']:.4f} "
+          f"({status}, constraint <= 0.20) roc_auc={m['roc_auc']:.4f}")
+    # The Task 2 constraint applies to data/validation; the augmented split is
+    # reported for reference only (robustness is addressed in Task 3).
+    m = results["validation_augmented"]
+    print(f"validation_augmented (reference only): recall_ai={m['recall']:.4f} "
+          f"fpr={m['fpr']:.4f} roc_auc={m['roc_auc']:.4f}")
 
 
 if __name__ == "__main__":

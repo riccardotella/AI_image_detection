@@ -35,13 +35,18 @@ OUT_DIR = Path(__file__).resolve().parent / "outputs"
 N_FFT_BINS = 8  # radial bins of the log-magnitude spectrum
 
 
-def features(images):
-    """Engineered features for uint8 images (N, H, W, 3).
+def features(images, chunk=2048):
+    """Engineered features for uint8 images (N, H, W, 3), computed in chunks
+    to bound memory (the FFT alone would need ~4 GB on the full train set)."""
+    return np.concatenate(
+        [_features_chunk(images[i:i + chunk]) for i in range(0, len(images), chunk)]
+    )
 
-    Per-channel mean/std, gradient-magnitude mean/std, saturation mean/std and
-    a radial profile of the FFT log-magnitude spectrum (AI generators tend to
-    leave characteristic high-frequency artifacts).
-    """
+
+def _features_chunk(images):
+    """Per-channel mean/std, gradient-magnitude mean/std, saturation mean/std
+    and a radial profile of the FFT log-magnitude spectrum (AI generators tend
+    to leave characteristic high-frequency artifacts)."""
     x = images.astype(np.float32) / 255.0
     n, h, w, _ = x.shape
     feats = []
