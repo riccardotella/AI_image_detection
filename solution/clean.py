@@ -82,14 +82,20 @@ def inspect_image(image_bytes):
         }
 
 
-def plot_class_distribution(df, output_path):
-    counts = df["source_class"].value_counts().sort_index()
+def plot_size_distribution(df, output_path):
+    valid = df[df["valid"]]
 
-    plt.figure(figsize=(6, 4))
-    counts.plot(kind="bar")
-    plt.title("Class distribution")
-    plt.xlabel("source_class")
-    plt.ylabel("count")
+    real = valid[valid["label"] == 0]
+    ai = valid[valid["label"] == 1]
+
+    plt.figure(figsize=(6, 5))
+    plt.scatter(real["width"], real["height"], s=8, alpha=0.4, label="real")
+    plt.scatter(ai["width"], ai["height"], s=8, alpha=0.4, label="ai_generated")
+
+    plt.title("Image size distribution")
+    plt.xlabel("width")
+    plt.ylabel("height")
+    plt.legend()
     plt.tight_layout()
     plt.savefig(output_path)
     plt.close()
@@ -192,6 +198,50 @@ def main():
 
     with open(output_dir / "stats.json", "w") as f:
         json.dump(stats, f, indent=2)
+
+    real = manifest[manifest["label"] == 0]
+    ai = manifest[manifest["label"] == 1]
+    
+    valid_real = real[real["valid"]]
+    valid_ai = ai[ai["valid"]]
+    
+    stats_per_class = {
+        "n_total": {
+            "real": int(len(real)),
+            "ai_generated": int(len(ai)),
+        },
+        "valid_rate": {
+            "real": float(real["valid"].mean()),
+            "ai_generated": float(ai["valid"].mean()),
+        },
+        "keep_rate": {
+            "real": float(real["keep"].mean()),
+            "ai_generated": float(ai["keep"].mean()),
+        },
+        "width_summary": {
+            "real": valid_real["width"].describe().to_dict(),
+            "ai_generated": valid_ai["width"].describe().to_dict(),
+        },
+        "height_summary": {
+            "real": valid_real["height"].describe().to_dict(),
+            "ai_generated": valid_ai["height"].describe().to_dict(),
+        },
+        "file_size_summary": {
+            "real": valid_real["file_size"].describe().to_dict(),
+            "ai_generated": valid_ai["file_size"].describe().to_dict(),
+        },
+        "formats": {
+            "real": valid_real["format"].value_counts().to_dict(),
+            "ai_generated": valid_ai["format"].value_counts().to_dict(),
+        },
+        "modes": {
+            "real": valid_real["mode"].value_counts().to_dict(),
+            "ai_generated": valid_ai["mode"].value_counts().to_dict(),
+        },
+    }
+    
+    with open(output_dir / "stats_per_class.json", "w") as f:
+        json.dump(stats_per_class, f, indent=2)
 
     # Figures for report
     plot_class_distribution(manifest, figures_dir / "class_distribution.png")
