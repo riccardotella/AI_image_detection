@@ -31,7 +31,8 @@ TARGET_FPR = 0.20      # hard constraint verified on data/validation
 CAL_TARGET_FPR = 0.16  # calibration quantile: finite-sample margin under 20%
 # Assignment limit: training must stay within 5x the Appendix C reference
 # runtime (measured 179.7s in the grading-like container -> 5x ~ 898s).
-TRAIN_BUDGET_SECONDS = 900
+# reduced empirically to 850s to leave a small margin for overhead.
+TRAIN_BUDGET_SECONDS = 850
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -105,7 +106,7 @@ def load_split(name):
 class SmallCNN(nn.Module):
     """Small CNN for binary classification; forward returns one logit per image."""
 
-    def __init__(self, k=32):
+    def __init__(self, k=32, dropout=0.2):
         super().__init__()
 
         def block(cin, cout, pool=True):
@@ -125,6 +126,7 @@ class SmallCNN(nn.Module):
             *block(4 * k, 4 * k, pool=False),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
+            nn.Dropout(p=dropout),
             nn.Linear(4 * k, 1),
         )
 
