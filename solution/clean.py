@@ -81,6 +81,14 @@ def inspect_image(image_bytes):
             "error": str(e),
         }
 
+def plot_class_distribution(df, output_path):
+    counts = df["source_class"].value_counts().sort_index()
+
+    plt.figure(figsize=(6, 4))
+    counts.plot(kind="bar")
+    plt.title("Class distribution")
+    plt.xlabel("source_class")
+    plt.ylabel("count")
 
 def plot_size_distribution(df, output_path):
     valid = df[df["valid"]]
