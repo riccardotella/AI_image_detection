@@ -23,7 +23,7 @@ from sklearn.metrics import (
 # ---------------------------------------------------------------------------
 IMG_SIZE = 96
 SEED = 42
-BATCH = 128
+BATCH = 256
 EPOCHS = 12  # the training loop is additionally capped by TRAIN_BUDGET_SECONDS
 LR = 2e-3
 DEVICE = "cpu"
@@ -104,26 +104,38 @@ def load_split(name):
 # Model
 # ---------------------------------------------------------------------------
 class SmallCNN(nn.Module):
-    """Small CNN for binary classification; forward returns one logit per image."""
+    """CPU-friendly CNN for binary AI-image detection."""
 
-    def __init__(self, k=32, dropout=0.2):
+    def __init__(self, k=32, dropout=0.0):
         super().__init__()
 
-        def block(cin, cout, pool=True):
-            layers = [
-                nn.Conv2d(cin, cout, kernel_size=3, padding=1),
+        def block(cin, cout, downsample=True):
+            stride = 2 if downsample else 1
+            return [
+                nn.Conv2d(
+                    cin,
+                    cout,
+                    kernel_size=3,
+                    stride=stride,
+                    padding=1,
+                ),
                 nn.BatchNorm2d(cout),
                 nn.ReLU(),
             ]
-            if pool:
-                layers.append(nn.MaxPool2d(kernel_size=2))
-            return layers
 
         self.net = nn.Sequential(
-            *block(3, k),
-            *block(k, 2 * k),
-            *block(2 * k, 4 * k),
-            *block(4 * k, 4 * k, pool=False),
+            # 96x96 -> 48x48
+            *block(3, k, downsample=True),
+
+            # 48x48 -> 24x24
+            *block(k, 2 * k, downsample=True),
+
+            # 24x24 -> 12x12
+            *block(2 * k, 4 * k, downsample=True),
+
+            # Keep 12x12
+            *block(4 * k, 4 * k, downsample=False),
+
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Dropout(p=dropout),
@@ -132,7 +144,6 @@ class SmallCNN(nn.Module):
 
     def forward(self, x):
         return self.net(x).squeeze(1)
-
 
 def score_images(model, images, batch=BATCH):
     """Sigmoid scores for uint8 images (N, H, W, 3); higher = more ai_generated."""
