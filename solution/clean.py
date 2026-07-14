@@ -15,7 +15,6 @@ import numpy as np
 import pandas as pd
 from PIL import Image
 
-MIN_SIDE = 32
 BASE_DIR = Path(__file__).resolve().parent
 TRAIN_DIR = BASE_DIR / "data" / "train"
 OUTPUT_DIR = BASE_DIR / "artifacts" / "clean"
@@ -190,22 +189,19 @@ def main():
 
     duplicate_copy = manifest.duplicated("sha256", keep="first") & manifest["sha256"].notna()
     conflict = manifest["sha256"].isin(conflicting_hashes)
-    valid_size = (
+    manifest["keep"] = (
         manifest["valid"]
-        & manifest["width"].ge(MIN_SIDE)
-        & manifest["height"].ge(MIN_SIDE)
+        & ~duplicate_copy
+        & ~conflict
     )
-    manifest["keep"] = valid_size & ~duplicate_copy & ~conflict
     manifest["removal_reason"] = np.select(
         [
             ~manifest["valid"],
-            manifest["valid"] & ~valid_size,
             conflict,
             duplicate_copy,
         ],
         [
             "invalid_or_unreadable",
-            "side_below_minimum",
             "duplicate_with_conflicting_labels",
             "exact_duplicate",
         ],
@@ -219,7 +215,6 @@ def main():
     valid = manifest[manifest["valid"]]
     stats = {
         "cleaning_rule": {
-            "minimum_side_pixels": MIN_SIDE,
             "require_full_decode": True,
             "same_label_duplicates": "keep first occurrence",
             "conflicting_label_duplicates": "remove whole group",
