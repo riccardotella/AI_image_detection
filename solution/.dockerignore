@@ -1,5 +1,8 @@
 data/
 artifacts/
-.DS_Store
 __pycache__/
-*.pyc
+*.py[cod]
+.git/
+.vscode/
+.idea/
+*.log

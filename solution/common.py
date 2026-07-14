@@ -1,6 +1,8 @@
-# common.py — shared configuration and helpers for all pipeline scripts.
+"""Shared configuration and utilities for the AMLS image-detection pipeline."""
 
+import csv
 import io
+import json
 import os
 import random
 from pathlib import Path
@@ -10,28 +12,14 @@ import pandas as pd
 import torch
 import torch.nn as nn
 from PIL import Image
-from sklearn.metrics import (
-    confusion_matrix,
-    f1_score,
-    precision_score,
-    recall_score,
-    roc_auc_score,
-)
+from sklearn.metrics import confusion_matrix, f1_score, precision_score, recall_score, roc_auc_score
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
 IMG_SIZE = 96
-SEED = 42
 BATCH = 256
-EPOCHS = 12  # the training loop is additionally capped by TRAIN_BUDGET_SECONDS
 LR = 2e-3
-DEVICE = "cpu"
-TARGET_FPR = 0.20      # hard constraint verified on data/validation
-CAL_TARGET_FPR = 0.16  # calibration quantile: finite-sample margin under 20%
-# Assignment limit: training must stay within 5x the Appendix C reference
-# runtime (measured 179.7s in the grading-like container -> 5x ~ 898s).
-# reduced empirically to 850s to leave a small margin for overhead.
+SEED = 42
+TARGET_FPR = 0.20
+CAL_TARGET_FPR = 0.16
 TRAIN_BUDGET_SECONDS = 850
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -39,11 +27,7 @@ DATA_DIR = BASE_DIR / "data"
 ARTIFACTS_DIR = BASE_DIR / "artifacts"
 
 
-# ---------------------------------------------------------------------------
-# Reproducibility
-# ---------------------------------------------------------------------------
 def set_seed(seed=SEED):
-    """Fix all RNG seeds and force deterministic, CPU-thread-safe execution."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -52,138 +36,178 @@ def set_seed(seed=SEED):
     try:
         torch.set_num_interop_threads(1)
     except RuntimeError:
-        pass  # already initialized; safe to continue
+        pass
 
 
-# ---------------------------------------------------------------------------
-# Data loading
-# ---------------------------------------------------------------------------
-def _image_bytes(x):
-    if isinstance(x, bytes):
-        return x
-    if isinstance(x, dict) and "bytes" in x:
-        return x["bytes"]
-    raise ValueError(f"Unsupported image cell type: {type(x)}")
+def image_bytes(value):
+    if isinstance(value, bytes):
+        return value
+    if isinstance(value, (bytearray, memoryview)):
+        return bytes(value)
+    if isinstance(value, dict) and "bytes" in value:
+        return image_bytes(value["bytes"])
+    raise ValueError(f"Unsupported image cell type: {type(value)}")
 
 
-def _decode(image_bytes):
-    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    img = img.resize((IMG_SIZE, IMG_SIZE), Image.BILINEAR)
-    return np.asarray(img, dtype=np.uint8)
+def decode_image(value):
+    with Image.open(io.BytesIO(image_bytes(value))) as image:
+        image = image.convert("RGB").resize(
+            (IMG_SIZE, IMG_SIZE), Image.Resampling.BILINEAR
+        )
+        return np.asarray(image, dtype=np.uint8)
 
 
-def load_split(name):
-    """Load data/<name>/ parquet files.
+def load_split(name, with_source=False):
+    """Load a labeled split or the unlabeled predict split.
 
-    Returns (images, labels): images is a uint8 array (N, IMG_SIZE, IMG_SIZE, 3);
-    labels is int64 with 0 = real, 1 = ai_generated for labeled splits.
-    For the unlabeled predict split the second value is the row_id array instead.
+    Returns ``(images, labels)`` for labeled data and ``(images, row_ids)`` for
+    predict. With ``with_source=True``, labeled data returns source classes too.
     """
     files = sorted((DATA_DIR / name).glob("*.parquet"))
     if not files:
         raise FileNotFoundError(f"No parquet files in {DATA_DIR / name}")
 
-    df = pd.concat([pd.read_parquet(f) for f in files], ignore_index=True)
-    images = np.stack([_decode(_image_bytes(x)) for x in df["image"]])
+    frame = pd.concat([pd.read_parquet(path) for path in files], ignore_index=True)
+    images = np.stack([decode_image(value) for value in frame["image"]])
 
-    if "source_class" in df.columns:
-        labels = (df["source_class"].to_numpy() != 0).astype(np.int64)
-    elif "source class" in df.columns:
-        labels = (df["source class"].to_numpy() != 0).astype(np.int64)
-    elif "row_id" in df.columns:
-        labels = df["row_id"].to_numpy(dtype=np.int64)
-    elif "row id" in df.columns:
-        labels = df["row id"].to_numpy(dtype=np.int64)
-    else:
-        raise ValueError(f"No label or row_id column in split '{name}'")
+    label_column = next(
+        (column for column in ("source_class", "source class") if column in frame),
+        None,
+    )
+    if label_column is not None:
+        source = frame[label_column].to_numpy(dtype=np.int64)
+        labels = (source != 0).astype(np.int64)
+        return (images, labels, source) if with_source else (images, labels)
 
-    return images, labels
+    row_column = next(
+        (column for column in ("row_id", "row id") if column in frame),
+        None,
+    )
+    if row_column is None:
+        raise ValueError(f"No labels or row IDs in split '{name}'")
+    if with_source:
+        raise ValueError("with_source=True is valid only for labeled splits")
+    return images, frame[row_column].to_numpy(dtype=np.int64)
 
 
-# ---------------------------------------------------------------------------
-# Model
-# ---------------------------------------------------------------------------
 class SmallCNN(nn.Module):
-    """CPU-friendly CNN for binary AI-image detection."""
+    """Small stride-based CNN designed for CPU training."""
 
-    def __init__(self, k=32, dropout=0.0):
+    def __init__(self, channels=32):
         super().__init__()
 
-        def block(cin, cout, downsample=True):
-            stride = 2 if downsample else 1
-            return [
-                nn.Conv2d(
-                    cin,
-                    cout,
-                    kernel_size=3,
-                    stride=stride,
-                    padding=1,
-                ),
-                nn.BatchNorm2d(cout),
+        def block(in_channels, out_channels, stride):
+            return (
+                nn.Conv2d(in_channels, out_channels, 3, stride=stride, padding=1),
+                nn.BatchNorm2d(out_channels),
                 nn.ReLU(),
-            ]
+            )
 
         self.net = nn.Sequential(
-            # 96x96 -> 48x48
-            *block(3, k, downsample=True),
-
-            # 48x48 -> 24x24
-            *block(k, 2 * k, downsample=True),
-
-            # 24x24 -> 12x12
-            *block(2 * k, 4 * k, downsample=True),
-
-            # Keep 12x12
-            *block(4 * k, 4 * k, downsample=False),
-
+            *block(3, channels, 2),
+            *block(channels, 2 * channels, 2),
+            *block(2 * channels, 4 * channels, 2),
+            *block(4 * channels, 4 * channels, 1),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Dropout(p=dropout),
-            nn.Linear(4 * k, 1),
+            nn.Identity(),  # preserves the original checkpoint key layout
+            nn.Linear(4 * channels, 1),
         )
 
-    def forward(self, x):
-        return self.net(x).squeeze(1)
+    def forward(self, inputs):
+        return self.net(inputs).squeeze(1)
 
-def score_images(model, images, batch=BATCH):
-    """Sigmoid scores for uint8 images (N, H, W, 3); higher = more ai_generated."""
+
+def score_images(model, images, batch_size=BATCH):
     model.eval()
-    x = torch.from_numpy(np.ascontiguousarray(images)).permute(0, 3, 1, 2)
+    tensor = torch.from_numpy(np.ascontiguousarray(images)).permute(0, 3, 1, 2)
     scores = []
     with torch.no_grad():
-        for i in range(0, len(x), batch):
-            xb = x[i:i + batch].float().div_(255.0)
-            scores.append(torch.sigmoid(model(xb)))
-    return torch.cat(scores).numpy()
+        for start in range(0, len(tensor), batch_size):
+            batch = tensor[start:start + batch_size].float().div_(255.0)
+            scores.append(torch.sigmoid(model(batch)).cpu())
+    return torch.cat(scores).numpy() if scores else np.empty(0, dtype=np.float32)
 
 
-# ---------------------------------------------------------------------------
-# Calibration and evaluation
-# ---------------------------------------------------------------------------
-def calibrate_threshold(scores_real, target_fpr=CAL_TARGET_FPR):
-    """Threshold from scores on REAL calibration images.
-
-    Predicting ai_generated when score > threshold keeps the calibration
-    false-positive rate at most target_fpr. The default calibrates below the
-    20% constraint to leave finite-sample margin on unseen validation data.
-    """
-    scores_real = np.asarray(scores_real, dtype=np.float64)
-    return float(np.quantile(scores_real, 1.0 - target_fpr, method="higher"))
+def calibrate_threshold(real_scores, target_fpr=CAL_TARGET_FPR):
+    real_scores = np.asarray(real_scores, dtype=np.float64)
+    return float(np.quantile(real_scores, 1.0 - target_fpr, method="higher"))
 
 
-def evaluate(y_true, y_score, threshold):
-    """Binary metrics at the given operating threshold (positive = score > threshold)."""
-    y_true = np.asarray(y_true)
-    y_score = np.asarray(y_score, dtype=np.float64)
-    y_pred = (y_score > threshold).astype(np.int64)
-
-    tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+def evaluate(labels, scores, threshold):
+    labels = np.asarray(labels, dtype=np.int64)
+    scores = np.asarray(scores, dtype=np.float64)
+    predictions = (scores > threshold).astype(np.int64)
+    tn, fp, fn, tp = confusion_matrix(labels, predictions, labels=[0, 1]).ravel()
     return {
-        "recall": float(recall_score(y_true, y_pred, zero_division=0)),
-        "precision": float(precision_score(y_true, y_pred, zero_division=0)),
-        "f1": float(f1_score(y_true, y_pred, zero_division=0)),
-        "roc_auc": float(roc_auc_score(y_true, y_score)),
+        "recall": float(recall_score(labels, predictions, zero_division=0)),
+        "precision": float(precision_score(labels, predictions, zero_division=0)),
+        "f1": float(f1_score(labels, predictions, zero_division=0)),
+        "roc_auc": float(roc_auc_score(labels, scores)),
+        "fpr": float(fp / (fp + tn)) if fp + tn else 0.0,
+        "fnr": float(fn / (fn + tp)) if fn + tp else 0.0,
         "confusion_matrix": [[int(tn), int(fp)], [int(fn), int(tp)]],
-        "fpr": float(fp / (fp + tn)) if (fp + tn) else 0.0,
-        "fnr": float(fn / (fn + tp)) if (fn + tp) else 0.0,
     }
+
+
+def stratified_split(labels, validation_fraction, rng):
+    real = rng.permutation(np.flatnonzero(labels == 0))
+    ai = rng.permutation(np.flatnonzero(labels == 1))
+    n_real = max(1, round(validation_fraction * len(real)))
+    n_ai = max(1, round(validation_fraction * len(ai)))
+    validation = np.concatenate((real[:n_real], ai[:n_ai]))
+    training = np.concatenate((real[n_real:], ai[n_ai:]))
+    return rng.permutation(training), rng.permutation(validation)
+
+
+def balanced_cycle(real_indices, ai_indices, rng):
+    sampled_ai = rng.choice(
+        ai_indices,
+        size=len(real_indices),
+        replace=len(ai_indices) < len(real_indices),
+    )
+    return rng.permutation(np.concatenate((real_indices, sampled_ai)))
+
+
+def save_model(model, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(model.state_dict(), temporary)
+    temporary.replace(path)
+
+
+def save_json(data, path):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        json.dump(data, handle, indent=2, allow_nan=False)
+    temporary.replace(path)
+
+
+def run_prediction(model_file, threshold_file, task_name):
+    set_seed()
+    models_dir = ARTIFACTS_DIR / "models"
+
+    model = SmallCNN()
+    model.load_state_dict(
+        torch.load(models_dir / model_file, map_location="cpu", weights_only=True)
+    )
+    with (models_dir / threshold_file).open(encoding="utf-8") as handle:
+        threshold = float(json.load(handle)["threshold"])
+
+    images, row_ids = load_split("predict")
+    predictions = (score_images(model, images) > threshold).astype(np.int64)
+
+    output = ARTIFACTS_DIR / task_name / "predictions.csv"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.writer(handle)
+        writer.writerow(("row_id", "predicted_label"))
+        writer.writerows(zip(row_ids, predictions))
+
+    print(
+        f"Wrote {len(predictions)} predictions "
+        f"({int(predictions.sum())} AI) -> {output}"
+    )

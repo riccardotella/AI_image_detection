@@ -1,17 +1,5 @@
-# baselines/classical_baseline.py — second model family for the Task 1.2
-# comparison (classical baseline on engineered features vs. the packaged CNN).
-# Development/report code: lives OUTSIDE solution/ because only the single best
-# pipeline is packaged, as allowed by the assignment.
-#
-# Run with the solution Docker image (repo mounted, prepared cache built):
-#   docker run --rm -v <repo>:/workspace/repo -w /workspace/repo \
-#     amls-solution python baselines/classical_baseline.py
-#
-# Protocol mirrors train.py exactly: train on the cleaned cache, calibrate the
-# threshold on data/calibration REAL images (FPR <= 20%), verify on
-# data/validation and data/validation_augmented.
+"""Classical Task 1.2 baseline: Random Forest on 20 engineered features."""
 
-import json
 import sys
 import time
 from pathlib import Path
@@ -28,62 +16,75 @@ from common import (  # noqa: E402
     calibrate_threshold,
     evaluate,
     load_split,
+    save_json,
     set_seed,
 )
 
-OUT_DIR = Path(__file__).resolve().parent / "outputs"
-N_FFT_BINS = 8  # radial bins of the log-magnitude spectrum
+OUTPUT = ARTIFACTS_DIR / "baseline" / "metrics.json"
+FFT_BINS = 8
 
 
-def features(images, chunk=2048):
-    """Engineered features for uint8 images (N, H, W, 3), computed in chunks
-    to bound memory (the FFT alone would need ~4 GB on the full train set)."""
+def extract_features(images, chunk_size=2048):
     return np.concatenate(
-        [_features_chunk(images[i:i + chunk]) for i in range(0, len(images), chunk)]
+        [
+            extract_chunk(images[start:start + chunk_size])
+            for start in range(0, len(images), chunk_size)
+        ]
     )
 
 
-def _features_chunk(images):
-    """Per-channel mean/std, gradient-magnitude mean/std, saturation mean/std
-    and a radial profile of the FFT log-magnitude spectrum (AI generators tend
-    to leave characteristic high-frequency artifacts)."""
-    x = images.astype(np.float32) / 255.0
-    n, h, w, _ = x.shape
-    feats = []
+def extract_chunk(images):
+    values = images.astype(np.float32) / 255.0
+    _, height, width, _ = values.shape
 
-    feats.append(x.mean(axis=(1, 2)))  # (N, 3)
-    feats.append(x.std(axis=(1, 2)))   # (N, 3)
+    gray = values.mean(axis=3)
+    dx = np.diff(gray, axis=2)
+    dy = np.diff(gray, axis=1)
+    magnitude = np.sqrt(dx[:, :-1] ** 2 + dy[:, :, :-1] ** 2)
+    chroma = values.max(axis=3) - values.min(axis=3)
 
-    gray = x.mean(axis=3)
-    gy = np.abs(np.diff(gray, axis=1)).mean(axis=(1, 2))
-    gx = np.abs(np.diff(gray, axis=2)).mean(axis=(1, 2))
-    gm = np.sqrt(
-        np.diff(gray, axis=1)[:, :, :-1] ** 2 + np.diff(gray, axis=2)[:, :-1, :] ** 2
+    spectrum = np.log1p(
+        np.abs(np.fft.fftshift(np.fft.fft2(gray), axes=(1, 2)))
     )
-    feats.append(np.stack([gx, gy, gm.mean(axis=(1, 2)), gm.std(axis=(1, 2))], axis=1))
-
-    sat = x.max(axis=3) - x.min(axis=3)  # cheap saturation proxy
-    feats.append(np.stack([sat.mean(axis=(1, 2)), sat.std(axis=(1, 2))], axis=1))
-
-    spectrum = np.log1p(np.abs(np.fft.fftshift(np.fft.fft2(gray), axes=(1, 2))))
-    yy, xx = np.mgrid[0:h, 0:w]
-    radius = np.sqrt((yy - h / 2) ** 2 + (xx - w / 2) ** 2)
-    bins = np.minimum((radius / radius.max() * N_FFT_BINS).astype(int), N_FFT_BINS - 1)
-    radial = np.stack(
-        [spectrum[:, bins == b].mean(axis=1) for b in range(N_FFT_BINS)], axis=1
+    yy, xx = np.mgrid[:height, :width]
+    radius = np.sqrt((yy - height / 2) ** 2 + (xx - width / 2) ** 2)
+    radial_bin = np.minimum(
+        (radius / radius.max() * FFT_BINS).astype(int), FFT_BINS - 1
     )
-    feats.append(radial)
+    radial_profile = np.stack(
+        [spectrum[:, radial_bin == index].mean(axis=1) for index in range(FFT_BINS)],
+        axis=1,
+    )
 
-    return np.concatenate(feats, axis=1)
+    return np.concatenate(
+        [
+            values.mean(axis=(1, 2)),
+            values.std(axis=(1, 2)),
+            np.stack(
+                [
+                    np.abs(dx).mean(axis=(1, 2)),
+                    np.abs(dy).mean(axis=(1, 2)),
+                    magnitude.mean(axis=(1, 2)),
+                    magnitude.std(axis=(1, 2)),
+                ],
+                axis=1,
+            ),
+            np.stack(
+                [chroma.mean(axis=(1, 2)), chroma.std(axis=(1, 2))], axis=1
+            ),
+            radial_profile,
+        ],
+        axis=1,
+    )
 
 
 def main():
     set_seed()
-    OUT_DIR.mkdir(parents=True, exist_ok=True)
-    start = time.perf_counter()
+    cache = np.load(ARTIFACTS_DIR / "prepared" / "train.npz", mmap_mode="r")
 
-    cache = np.load(ARTIFACTS_DIR / "prepared" / "train.npz")
-    X_train, y_train = features(cache["X"]), cache["y"].astype(int)
+    start = time.perf_counter()
+    training_features = extract_features(cache["X"])
+    feature_seconds = time.perf_counter() - start
 
     model = RandomForestClassifier(
         n_estimators=300,
@@ -91,34 +92,39 @@ def main():
         random_state=SEED,
         n_jobs=8,
     )
-    model.fit(X_train, y_train)
-    train_seconds = time.perf_counter() - start
+    start = time.perf_counter()
+    model.fit(training_features, cache["y"].astype(int))
+    fit_seconds = time.perf_counter() - start
 
-    cal_X, cal_y = load_split("calibration")
-    cal_scores_real = model.predict_proba(features(cal_X[cal_y == 0]))[:, 1]
-    threshold = calibrate_threshold(cal_scores_real)
+    calibration_images, calibration_labels = load_split("calibration")
+    real_scores = model.predict_proba(
+        extract_features(calibration_images[calibration_labels == 0])
+    )[:, 1]
+    threshold = calibrate_threshold(real_scores)
 
     results = {
-        "model_family": "RandomForest on engineered features "
-                        "(color/gradient/saturation stats + FFT radial profile)",
-        "n_features": int(X_train.shape[1]),
-        "train_seconds": round(train_seconds, 1),
+        "model_family": (
+            "Random Forest on color, gradient, RGB-chroma and FFT radial features"
+        ),
+        "n_features": int(training_features.shape[1]),
+        "feature_extraction_seconds": feature_seconds,
+        "model_fit_seconds": fit_seconds,
         "threshold": threshold,
     }
     for split in ("validation", "validation_augmented"):
-        sx, sy = load_split(split)
-        scores = model.predict_proba(features(sx))[:, 1]
-        results[split] = evaluate(sy, scores, threshold)
+        images, labels = load_split(split)
+        scores = model.predict_proba(extract_features(images))[:, 1]
+        results[split] = evaluate(labels, scores, threshold)
 
-    with open(OUT_DIR / "metrics.json", "w") as f:
-        json.dump(results, f, indent=2)
-
-    print(f"threshold={threshold:.6f} (train {train_seconds:.0f}s)")
-    for split in ("validation", "validation_augmented"):
-        m = results[split]
-        print(f"{split}: recall_ai={m['recall']:.4f} fpr={m['fpr']:.4f} "
-              f"roc_auc={m['roc_auc']:.4f}")
-    print(f"wrote {OUT_DIR / 'metrics.json'}")
+    save_json(results, OUTPUT)
+    print(
+        f"Baseline complete in {feature_seconds + fit_seconds:.1f}s: "
+        f"validation recall={results['validation']['recall']:.4f}, "
+        f"fpr={results['validation']['fpr']:.4f}, "
+        f"augmented recall={results['validation_augmented']['recall']:.4f}, "
+        f"fpr={results['validation_augmented']['fpr']:.4f}"
+    )
+    print(f"Wrote {OUTPUT}")
 
 
 if __name__ == "__main__":
