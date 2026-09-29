@@ -29,7 +29,7 @@ This project delivers a robust, self-contained detection pipeline that:
 
 ---
 
-## 🛠 System Pipeline & Methods
+## System Pipeline & Methods
 
 ```
 data/train/ ──► [ clean.py ] ──► [ prepare.py ] ──► [ train.py ] ──────────► [ predict.py ]
@@ -92,7 +92,7 @@ data/train/ ──► [ clean.py ] ──► [ prepare.py ] ──► [ train.py
 
 ---
 
-## ⚙️ Execution Guide
+## Execution Guide
 (The dataset was provided by the professor, if access is needed, feel free to open a request)
 ### 1. Build Docker Image
 ```bash
@@ -130,7 +130,7 @@ docker run --cpus 8 --network none -v $(pwd)/data:/workspace/solution/data:ro am
 
 ---
 
-## 👥 Authors
+## Authors
 * **Riccardo Tellarini**
 * **XiangYu Zhang**
 * **Thomas Bove**
